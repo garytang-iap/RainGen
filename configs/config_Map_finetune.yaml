@@ -1,0 +1,66 @@
+run:
+  output_dir: "./raingen_finetune_v1"
+
+data:
+  # 你的站点 Patch 目录
+  station_data_dir: "/home/tangxiao_iap/Dreambooth/station_dataset/station_dataset_v2"
+  # 你的原始预训练数据目录 (作为 Prior)
+  grid_data_dir: "/home/tangxiao_iap/gpm/train"
+  
+  crop_size: 128
+  precip_channels: 1
+  radar_channels: 7
+  
+  # 必须和预训练保持一致！
+  radar_mean: 0.525924
+  radar_std: 0.989234
+  precip_mean: 0.104368
+  precip_std: 0.336201
+
+model:
+  # --- Denoiser (SparseUNet) 和 Encoder (SparseEncoder) 共享的参数 ---
+  channels: 1           # 降水通道
+  condition_dim: 7      # 5雷达 + 2坐标 
+  nf: 64
+  time_emb_dim: 256
+  img_size: 128          # 必须与 crop_size 保持一致
+  uno_res: 128          # 使用超分插值，为模型提供更大的思考空间
+  knn_neighbours: 3
+  backend: "spconv"
+  uno_mults: [1, 2, 4,4]
+  blocks_per_level: [2, 2, 2,2] # 确保与uno_mults长度一致
+  attn_res: [16]
+  uno_base_nf: 128
+  conv_type: "conv"
+  kernel_size: 7
+  depthwise_sparse: False
+  num_conv_blocks: 3
+  # --- Encoder/Denoiser 特有的参数 ---
+  z_dim: 1024             # z向量维度
+  stochastic_encoding: False # 不使用VAE模式
+  # 【修改2】设置KLD损失权重
+  kld_weight: 0.0001
+  cond_drop_prob: 0.1
+
+diffusion:
+  steps: 1000
+  noise_schedule: "cosine"
+  
+train:
+  pretrained_path: "/home/tangxiao_iap/INR/raingen_map/checkpoint.pth.tar" # 预训练权重路径
+  
+  lr: 1e-6                 # 比预训练(2e-5)小，防止破坏特征
+  steps: 100000             # 微调步数不用太多
+  save_every: 1000
+  
+  batch_size_station: 1    # 站点数据 Batch
+  batch_size_grid: 4       # 背景数据 Batch
+  
+  q_sample_grid: 8000      # Grid 数据的采样点数
+  
+  prior_loss_weight: 1.0   # Prior Loss 的权重，建议 1.0
+
+inference:
+  ddim_steps: 50
+  eta: 0.0
+  guidance_scale: 3.0

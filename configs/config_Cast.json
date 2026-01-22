@@ -1,0 +1,64 @@
+{
+    "model_svd_unet": {
+        "Note": "Configuration for the SVD-based UNet backbone.",
+        "input_size": 64,
+        "in_channels": 16,
+        "out_channels": 16,
+        "model_channels": 128,
+        "attention_resolutions": [4, 2],
+        "num_res_blocks": 1,
+        "channel_mult": [1, 2,2,4],
+        "num_head_channels": 32,
+        "use_spatial_transformer": true,
+        "transformer_depth": 1
+    },
+    "model_vae": {
+        "name": "AEKL",
+        "vae_input_channels": 1,
+        "latent_channels": 16,
+        "vae_out_channels": 1,
+        "vae_checkpoint": "/home/tangxiao_iap/DiT/AEKL/logs_512/checkpoints/checkpoint_best.pth.tar"
+    },
+    "diffusion": {
+        "timesteps": 1000,
+        "sampling_timesteps": 300,
+        "ddim_sampling_eta": 0.0,
+        "cond_scale": 1.0,
+        "objective": "pred_v",
+        "schedule": "cosine",
+        "offset_noise_strength": 0.0,
+        "cond_drop_prob": 0.0,
+        "enable_cfg": true
+    },
+    "trainer": {
+        "epochs": 520,
+        "start_epoch": 0,
+        "batch_size": 2,
+        "gradient_accumulation_steps": 4,
+        "warmup_epochs": 10,
+        "lr": 2e-5,
+        "min_lr": 1e-7,
+        "weight_decay": 1e-4,
+        "max_grad_norm": 1.5,
+        "ema_decay": 0.999,
+        "resume_lr_factor": 0.5,
+        "train_fig": "./log_512/figs/train",
+        "test_fig": "./log_512/figs/test",
+        "log_dir": "./log_512/logs",
+        "checkpoint_dir": "./log_512/checkpoints"
+    },
+    "data": {
+    "data_train": "/home/tangxiao_iap/256crop/train",
+    "data_val": "/home/tangxiao_iap/256crop/test",
+    "data_test": "/home/tangxiao_iap/256crop/test",
+    "preprocessed_data_train": "/home/tangxiao_iap/512radar/vae_encoded/train",
+    "preprocessed_data_val": "/home/tangxiao_iap/512radar/vae_encoded/test",
+    "is_crop": 1,
+    "crop_size": 256,
+    "input_frames": 10,
+    "output_frames": 30,
+    "Total_std": 0.901894227738482,
+    "Total_mean": 0.3365975298905586,
+    "scale_factor": 0.01
+    }
+    }
