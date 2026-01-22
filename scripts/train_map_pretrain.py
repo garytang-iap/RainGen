@@ -171,9 +171,10 @@ def load_checkpoint(denoiser, ema_denoiser, optimizer, scheduler, output_dir, de
 # ==============================================================================
 # 验证与可视化
 # ==============================================================================
+# train_enhanced_sparse_unet.py
+
 @torch.no_grad()
 def validate(diffusion, denoiser_ema, val_loader, H, device, global_step):
-    """修改：移除encoder，使用直接条件"""
     denoiser_ema.eval()
     total_loss = 0.0
     num_val_batches = 0
@@ -191,11 +192,20 @@ def validate(diffusion, denoiser_ema, val_loader, H, device, global_step):
 
         B, _, H_crop, W_crop = precip_grid.shape
         num_points = min(H["mc_integral"]["q_sample"], H_crop * W_crop)
+        
+        # 1. 生成随机索引
         sample_lst = torch.stack([
             torch.from_numpy(np.random.choice(H_crop * W_crop, num_points, replace=False))
             for _ in range(B)
         ]).to(device)
 
+        # 🔥🔥🔥【关键修改】🔥🔥🔥
+        # 必须对索引进行排序！SpConv 内部是按空间顺序处理的。
+        # 如果这里不排序，gather 出来的特征是乱序的，但 SpConv 输出是排序的，导致错位。
+        sample_lst, _ = torch.sort(sample_lst, dim=1) 
+
+        # 2. 使用【排序后】的 sample_lst 进行 gather
+        # 这样 input(radar) 和 target(precip) 都是按照空间顺序排列的 (row-major)
         radar_points = _gather_from_grid(radar_grid, sample_lst)            # [B,L,5]
         coords_abs_points = _gather_from_grid(coords_abs_grid, sample_lst)  # [B,L,2]
         coords_geo_points = _gather_from_grid(coords_geo_grid, sample_lst)  # [B,L,2]
@@ -205,14 +215,15 @@ def validate(diffusion, denoiser_ema, val_loader, H, device, global_step):
         t = torch.randint(0, diffusion.num_timesteps, (B,), device=device).long()
         model_kwargs = {
             "condition": condition,
-            "sample_lst": sample_lst,
+            "sample_lst": sample_lst, # 传入排序后的索引
             "coords": coords_geo_points
         }
 
-        
+        # Loss 计算时，diffusion 内部会用 sample_lst 去 gather x_start (precip)
+        # 因为 sample_lst 已经排序，所以取出的 precip 也是有序的，与模型输出对应。
         loss_dict = diffusion.training_losses(
             model=denoiser_ema, 
-            x_start=precip_grid,  # ← 只传递降水
+            x_start=precip_grid, 
             t=t,
             sample_lst=sample_lst, 
             model_kwargs=model_kwargs
@@ -231,149 +242,92 @@ def validate(diffusion, denoiser_ema, val_loader, H, device, global_step):
 
 @torch.no_grad()
 def visualize_and_log(diffusion, denoiser_ema, vis_data, epoch, global_step, H, output_dir):
-    """修改：移除encoder，使用直接条件，并修复采样时的维度问题"""
     if not is_main_process() or vis_data is None: return
     print(f"\n🎨 Generating visualization for step {global_step}...")
     denoiser_ema.eval()
-    
     device = next(denoiser_ema.parameters()).device
     
-    # ✅ vis_data 是 dataset 的单样本 dict：把 combined_patch 也取出来
-    combined_patch = vis_data["combined_patch"].to(device).unsqueeze(0)  # [1,1+5,H,W]
-    coords_abs_grid = vis_data["coords_abs_patch"].to(device).unsqueeze(0)  # [1,2,H,W]
-    coords_geo_grid = vis_data["coords_geo_patch"].to(device).unsqueeze(0)  # [1,2,H,W]
+    # 1. 准备数据 (全图)
+    # [1, C_total, H, W]
+    combined_patch = vis_data["combined_patch"].to(device).unsqueeze(0)
+    coords_abs_grid = vis_data["coords_abs_patch"].to(device).unsqueeze(0)
+    coords_geo_grid = vis_data["coords_geo_patch"].to(device).unsqueeze(0)
 
-    precip_grid = combined_patch[:, :H["data"]["precip_channels"], ...]   # [1,1,H,W]
-    radar_grid  = combined_patch[:, H["data"]["precip_channels"]:, ...]   # [1,5,H,W]
-    true_precip_grid = precip_grid  # ✅ 真实目标
-
-    radar_grid = combined_patch[:, H["data"]["precip_channels"]:, ...]
+    # 拆分降水(Target) 和 雷达(Condition)
+    precip_grid = combined_patch[:, :H["data"]["precip_channels"]]
+    radar_grid  = combined_patch[:, H["data"]["precip_channels"]:]
     
-    B, _, H_crop, W_crop = radar_grid.shape
+    B, _, H_crop, W_crop = precip_grid.shape
     
-    # 🔥 新的条件准备方式 - 使用全网格采样进行可视化
-    all_indices = torch.arange(H_crop * W_crop, device=device).unsqueeze(0)  # [1,H*W]
-    num_points = all_indices.shape[1]
+    # 2. 准备 Condition (保持全图形状，不 Gather！)
+    # [1, 5, H, W] + [1, 2, H, W] -> [1, 7, H, W]
+    condition_dense = torch.cat([radar_grid, coords_abs_grid], dim=1)
+    
+    # 准备坐标 (虽然模型能自动处理，但为了保险，展平传进去)
+    # [1, 2, H, W] -> [1, H*W, 2]
+    coords_geo_flat = rearrange(coords_geo_grid, 'b c h w -> b (h w) c')
 
-    radar_points      = _gather_from_grid(radar_grid, all_indices)           # [1,H*W,5]
-    coords_abs_points = _gather_from_grid(coords_abs_grid, all_indices)      # [1,H*W,2]
-    coords_geo_points = _gather_from_grid(coords_geo_grid, all_indices)      # [1,H*W,2]
-
-    condition = torch.cat([radar_points, coords_abs_points], dim=-1)         # [1,H*W,7]
-
+    # 构造传给模型的参数
+    # 注意：我们不需要传 'sample_lst'，因为模型检测到全图输入会自动生成全图索引
     model_kwargs = {
-        "condition": condition,
-        "sample_lst": all_indices,
-        "coords": coords_geo_points
+        "condition": condition_dense,  # 🔥 直接传全图，模型Forward里会自动处理
+        "coords": coords_geo_flat      # 坐标
     }
 
-# ✅ 关键：sampling 的 shape 要和模型输入一致：[B,L,C]
-    sparse_shape = (B, num_points, H["data"]["precip_channels"])
-    
-    betas = get_named_beta_schedule(H["diffusion"]["noise_schedule"], H["diffusion"]["steps"]) #, resolution=H['data']['crop_size'])
-    
+    # 3. 初始化推理用的 Diffusion (开启 DCT)
+    betas = get_named_beta_schedule(H["diffusion"]["noise_schedule"], H["diffusion"]["steps"])
+    ddim_diffusion = SpacedDiffusion(
+        use_timesteps=space_timesteps(diffusion.num_timesteps, f"ddim{H['inference'].get('ddim_steps', 50)}"),
+        betas=betas,
+        model_mean_type=ModelMeanType.MOLLIFIED_EPSILON, # 必须一致
+        model_var_type=ModelVarType.FIXED_LARGE,
+        loss_type=LossType.MSE,
+        precip_channels=H["data"]["precip_channels"],
+        rescale_timesteps=True,
+        mollifier_type="dct",            # ✅ 必须开启 DCT
+        img_size=H["data"]["crop_size"]  # ✅ 必须填
+    )
+
     try:
-        ddim_steps = H["inference"].get("ddim_steps", 50)
-        use_timesteps = space_timesteps(diffusion.num_timesteps, f"ddim{ddim_steps}")
+        # 🔥 4. 采样
+        # shape 必须是全图形状，这样 DCT 才能工作
+        dense_shape = (B, H["data"]["precip_channels"], H_crop, W_crop)
         
-        ddim_diffusion = SpacedDiffusion(
-            use_timesteps,
-            betas=betas,
-            model_mean_type=ModelMeanType.MOLLIFIED_EPSILON,
-            model_var_type=ModelVarType.FIXED_LARGE,
-            loss_type=LossType.MSE,
-            precip_channels=H["data"]["precip_channels"],
-            rescale_timesteps=True,
-            mollifier_type="dct"
-        )
-        
-        # 🔥🔥🔥 关键修复点 🔥🔥🔥
-        # 传递稀疏形状 `sparse_shape` 而不是稠密的 `shape`
-        samples, _ = ddim_diffusion.ddim_sample_loop(
-            denoiser_ema,
-            sparse_shape, # <--- 使用稀疏形状
+        samples_grid, _ = ddim_diffusion.ddim_sample_loop(
+            model=denoiser_ema, # 🔥 直接传模型，不需要 Wrapper 了！
+            shape=dense_shape,  # 🔥 告诉它是全图
             model_kwargs=model_kwargs,
             progress=True,
-            clip_denoised=False,
             eta=H["inference"].get("eta", 0.0),
-            xidance_scale=3.0
-            
+            guidance_scale=H["inference"].get("guidance_scale", 3.0)
         )
         print("✅ DDIM sampling successful!")
+        
+        # --- 5. 绘图 (和之前一样) ---
+        vis_path = os.path.join(output_dir, "visualizations")
+        os.makedirs(vis_path, exist_ok=True)
+        
+        # 反归一化
+        pred_vis = (samples_grid[0, 0].cpu().numpy() * H["data"]["precip_std"]) + H["data"]["precip_mean"]
+        true_vis = (precip_grid[0, 0].cpu().numpy() * H["data"]["precip_std"]) + H["data"]["precip_mean"]
+        radar_vis = (radar_grid[0, 0].cpu().numpy() * H["data"]["radar_std"]) + H["data"]["radar_mean"]
+        
+        # Clip negative values
+        pred_vis = np.maximum(pred_vis, 0)
+        true_vis = np.maximum(true_vis, 0)
+        
+        fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+        ax[0].imshow(radar_vis, cmap='jet'); ax[0].set_title("Input Radar")
+        ax[1].imshow(true_vis, cmap='Blues', vmin=0, vmax=pred_vis.max()); ax[1].set_title("Ground Truth")
+        ax[2].imshow(pred_vis, cmap='Blues', vmin=0, vmax=pred_vis.max()); ax[2].set_title(f"Generated (Step {global_step})")
+        
+        save_file = os.path.join(vis_path, f"epoch_{epoch}_step_{global_step}.png")
+        plt.savefig(save_file)
+        plt.close()
 
     except Exception as e:
-        # ... (错误处理部分保持不变) ...
-        print(f"❌ DDIM sampling failed: {e}. Falling back to regular DDPM sampling.")
-        import traceback
-        traceback.print_exc()
-        try:
-            # Fallback 也需要使用稀疏形状
-            samples, _ = diffusion.p_sample_loop(
-                denoiser_ema,
-                sparse_shape, # <--- 使用稀疏形状
-                model_kwargs=model_kwargs,
-                progress=True,
-                clip_denoised=False,
-                guidance_scale=7.0
-            )
-            print("✅ Regular DDPM sampling successful!")
-        except Exception as e2:
-            print(f"❌ Regular DDPM sampling also failed: {e2}")
-            return
-
-    # 🔥🔥🔥 关键修复点 🔥🔥🔥
-    # `samples` 现在是稀疏点云 [B, num_points, C], 需要将其重建成图像网格进行可视化
-    # 定义目标网格的形状
-    target_grid_shape = (B, H["data"]["precip_channels"], H_crop, W_crop)
-    
-    # 调用辅助函数完成恢复
-    samples_grid = scatter_points_to_grid(samples, all_indices, target_grid_shape)
-    
-    # --- 后续的可视化代码 ---
-    # `samples_grid` 现在是4D的图像张量，可以用于后续处理
-    samples_log1p = (samples_grid.cpu() * H["data"]["precip_std"]) + H["data"]["precip_mean"]
-    samples_physical = torch.expm1(samples_log1p).clamp(min=0)
-    
-    radar_log1p = (radar_grid.cpu() * H["data"]["radar_std"]) + H["data"]["radar_mean"]
-    radar_physical = torch.expm1(radar_log1p)
-    
-    # 获取真实降水用于对比
-    true_precip_log1p = (true_precip_grid.cpu() * H["data"]["precip_std"]) + H["data"]["precip_mean"]
-    true_precip_physical = torch.expm1(true_precip_log1p).clamp(min=0)
-
-    condition_vis = radar_physical.squeeze(0)[-1].numpy()
-    samples_vis = samples_physical.squeeze(0).squeeze(0).numpy()
-    true_precip_vis = true_precip_physical.squeeze(0).squeeze(0).numpy()
-
-    vis_dir = os.path.join(output_dir, "visualizations")
-    os.makedirs(vis_dir, exist_ok=True)
-    save_path = os.path.join(vis_dir, f"epoch_{epoch+1:04d}_step_{global_step:07d}.png")
-    
-    # 修改绘图以包含真实降水
-    fig, axes = plt.subplots(1, 3, figsize=(22, 7)) # 1x3
-    fig.suptitle(f"Epoch {epoch+1} / Step {global_step}", fontsize=16)
-
-    ax0_img = axes[0].imshow(condition_vis, cmap='jet', vmin=0, vmax=50)
-    axes[0].set_title("Input Radar (Last Frame, dBZ)")
-    axes[0].axis('off')
-    fig.colorbar(ax0_img, ax=axes[0], fraction=0.046, pad=0.04, label="Reflectivity (dBZ)")
-
-    vmax_precip = max(10, np.percentile(np.concatenate([samples_vis.flatten(), true_precip_vis.flatten()]), 99.8))
-
-    ax1_img = axes[1].imshow(true_precip_vis, cmap='YlGnBu', vmin=0, vmax=vmax_precip)
-    axes[1].set_title("Ground Truth Precipitation")
-    axes[1].axis('off')
-    fig.colorbar(ax1_img, ax=axes[1], fraction=0.046, pad=0.04, label="Precipitation (mm/h)")
-
-    ax2_img = axes[2].imshow(samples_vis, cmap='YlGnBu', vmin=0, vmax=vmax_precip)
-    axes[2].set_title("Generated Precipitation (EMA Model)")
-    axes[2].axis('off')
-    fig.colorbar(ax2_img, ax=axes[2], fraction=0.046, pad=0.04, label="Precipitation (mm/h)")
-
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig(save_path)
-    plt.close(fig)
-    print(f"🎨 Visualization saved to: {save_path}")
+        print(f"❌ Sampling failed: {e}")
+        import traceback; traceback.print_exc()
 # ==============================================================================
 # 主函数
 # ==============================================================================
@@ -409,7 +363,8 @@ def main(H):
         radar_mean=H["data"]["radar_mean"],
         radar_std=H["data"]["radar_std"],
         precip_mean=H["data"]["precip_mean"],
-        precip_std=H["data"]["precip_std"]
+        precip_std=H["data"]["precip_std"],
+        crop_size=H["data"]['crop_size']
     )
     
     val_dataset = RadarPrecipitationFixedRegionDataset(
@@ -418,7 +373,8 @@ def main(H):
         radar_mean=H["data"]["radar_mean"],
         radar_std=H["data"]["radar_std"],
         precip_mean=H["data"]["precip_mean"],
-        precip_std=H["data"]["precip_std"]
+        precip_std=H["data"]["precip_std"],
+        crop_size=H["data"]['crop_size']
     )
     
     # === 🔥 修改结束 ===
@@ -454,7 +410,9 @@ def main(H):
         dropout_res=H["model"].get("dropout_res", 16),
         dropout=H["model"].get("dropout", 0.1),
         uno_base_nf=H["model"].get("uno_base_nf", 64),
-        cond_drop_prob=H['model'].get("cond_drop_prob",0.1)
+        cond_drop_prob=H['model'].get("cond_drop_prob",0.1),
+        virtual_scale=H["model"].get("virtual_scale", 1)
+
     ).to(device)
     
     ema_denoiser = EnhancedSparseUNet(
@@ -477,7 +435,9 @@ def main(H):
         dropout_res=H["model"].get("dropout_res", 16),
         dropout=H["model"].get("dropout", 0.1),
         uno_base_nf=H["model"].get("uno_base_nf", 64),
-        cond_drop_prob=H['model'].get("cond_drop_prob",0.1)
+        cond_drop_prob=H['model'].get("cond_drop_prob",0.1),
+        virtual_scale=H["model"].get("virtual_scale", 1)
+
     ).to(device)
 
     # 🔥 优化器：只优化denoiser
@@ -511,26 +471,32 @@ def main(H):
         denoiser.train()
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{H['train']['epochs']}", disable=not is_main_process())
-
         for batch_data in pbar:
             if batch_data is None: continue
+            
             optimizer.zero_grad()
             
             combined_patch = batch_data["combined_patch"].to(device, non_blocking=True)
             coords_abs_grid = batch_data["coords_abs_patch"].to(device, non_blocking=True)
             coords_geo_grid = batch_data["coords_geo_patch"].to(device, non_blocking=True)
 
-
             precip_grid = combined_patch[:, :H["data"]["precip_channels"], ...]
             radar_grid  = combined_patch[:, H["data"]["precip_channels"]:, ...]
 
             B, _, H_crop, W_crop = precip_grid.shape
             num_points = min(H["mc_integral"]["q_sample"], H_crop * W_crop)
+            
+            # 1. 生成随机索引
             sample_lst = torch.stack([
                 torch.from_numpy(np.random.choice(H_crop * W_crop, num_points, replace=False))
                 for _ in range(B)
             ]).to(device)
 
+            # 🔥🔥🔥【关键修改】🔥🔥🔥
+            # 对 sample_lst 进行排序
+            sample_lst, _ = torch.sort(sample_lst, dim=1)
+
+            # 2. 使用排序后的 sample_lst 提取数据
             radar_points      = _gather_from_grid(radar_grid, sample_lst)          # [B,L,5]
             coords_abs_points = _gather_from_grid(coords_abs_grid, sample_lst)     # [B,L,2]
             coords_geo_points = _gather_from_grid(coords_geo_grid, sample_lst)     # [B,L,2]
@@ -540,20 +506,18 @@ def main(H):
             model_kwargs = {
                 "condition": condition,
                 "sample_lst": sample_lst,
-                "coords": coords_geo_points,   # ✅ UNO/KNN/grid_sample 只用几何坐标
+                "coords": coords_geo_points,
             }
-
 
             t = torch.randint(0, diffusion.num_timesteps, (B,), device=device).long()
             
-
-            
             denoiser_fn = denoiser.module if hasattr(denoiser, 'module') else denoiser
+            
             loss_dict = diffusion.training_losses(
                 model=denoiser_fn, 
-                x_start=precip_grid,  # ← 只传递降水
+                x_start=precip_grid, 
                 t=t,
-                sample_lst=sample_lst,
+                sample_lst=sample_lst, # 传入排序后的列表
                 model_kwargs=model_kwargs
             )
             loss = loss_dict["loss"].mean()
@@ -616,7 +580,7 @@ def main(H):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default="/home/tangxiao_iap/mapping/config_new.yaml", help='Path to the YAML configuration file.')
+    parser.add_argument('--config', type=str, default="/home/tangxiao_iap/INR/config_new.yaml", help='Path to the YAML configuration file.')
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:

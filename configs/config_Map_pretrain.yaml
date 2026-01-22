@@ -8,7 +8,8 @@ data:
   patch_data_dir: "/home/tangxiao_iap/gpm/train"  # 新增：patch数据目录
   #data_dir: "/public/home/jarvis226/TX_file/full_GPM_mapping_configurable"
   full_grid_shape: [211, 311]
-  crop_size: 196
+  crop_size: 128
+  virtual_scale: 10
   precip_channels: 1
   radar_channels: 7
   normalize: True
@@ -23,20 +24,20 @@ model:
   # --- Denoiser (SparseUNet) 和 Encoder (SparseEncoder) 共享的参数 ---
   channels: 1           # 降水通道
   condition_dim: 7      # 5雷达 + 2坐标 
-  nf: 128
+  nf: 64
   time_emb_dim: 256
-  img_size: 196          # 必须与 crop_size 保持一致
-  uno_res: 256          # 使用超分插值，为模型提供更大的思考空间
+  img_size: 128          # 必须与 crop_size 保持一致
+  uno_res: 128          # 使用超分插值，为模型提供更大的思考空间
   knn_neighbours: 3
-  backend: "torch_dense"
-  uno_mults: [1, 2, 2,4]
+  backend: "spconv"
+  uno_mults: [1, 2, 4,4]
   blocks_per_level: [2, 2, 2,2] # 确保与uno_mults长度一致
-  attn_res: []
+  attn_res: [16]
   uno_base_nf: 128
   conv_type: "conv"
-  kernel_size: 3
-  depthwise_sparse: True
-  num_conv_blocks: 2
+  kernel_size: 7
+  depthwise_sparse: False
+  num_conv_blocks: 3
   # --- Encoder/Denoiser 特有的参数 ---
   z_dim: 1024             # z向量维度
   stochastic_encoding: False # 不使用VAE模式
@@ -53,17 +54,17 @@ diffusion:
   mollifier_type: "dct"
 
 mc_integral:
-  q_sample: 8192 # 64*64=4096, 采样25%
+  q_sample: 8000 # 64*64=4096, 采样25%
 
 train:
   epochs: 1000
-  batch_size_per_gpu: 2 # 由于uno_res=128，batch_size可能需要根据显存调整
+  batch_size_per_gpu: 8 # 由于uno_res=128，batch_size可能需要根据显存调整
   lr: 0.00002
   ema_decay: 0.995
   checkpoint_every_epochs: 10
   visualize_every_epochs: 5
   num_workers: 8
-  gradient_clip_val: 5.0
+  gradient_clip_val: 2.0
   warmup_ratio: 0.02
   kld_warmup_steps: 4000
 
